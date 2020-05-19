@@ -1,0 +1,82 @@
+def OD_follow_up(Foo15arl_amend, customer, od_PIC_PRS, od_Customer_list_PRS, location, cargo, dispute_instance, tp_doc_after_2017, shipment, multiple_AFR_check):
+    OS = Foo15arl_amend[F.col('comp_code').isin('1000','1100','4000','5000','7000','8000')]
+    # OS = OS[F.col('ac_doc_typ').isin('RV','ZQ','Z8')]
+    OS = OS[F.col('ac_doc_typ').isin('RV','ZQ','Z8','DQ','DZ','ZR','DD','Y8','ZJ')]
+    OS = OS.filter((F.col('fi_docstat') == 'O') & (F.length(F.col('alloc_nmbr')) == 9))
+    # filter PRS bus_area
+    OS = OS.filter(F.col('bus_area') == 'MO00')
+    OS = OS.withColumn('days_in_arrears' , F.datediff(F.current_date(),F.col('netduedate')))
+    
+    # dipute
+    dispute = dispute_instance.withColumnRenamed('invoice_number','ac_doc_no')
+    window = Window.partitionBy('ac_doc_no').orderBy(F.col('case_id').desc())    
+    dispute = dispute.withColumn('row',  F.row_number().over(window))
+    dispute = dispute.filter(F.col('row') == 1).select('ac_doc_no',F.col('case_status_description').alias('dispute_status'),F.lit(None).alias('dis_sumarry')).distinct()
+    
+    OS = OS.join(dispute,'ac_doc_no','left')
+    dis_sumarry = [('Collectable - Missin','Dispute Rejected'),('In Process','Under Dispute Resolution'),('Collectable - Reject','Dispute Rejected'),('New','Under Dispute Resolution'),('Redisputed','Under Dispute Resolution'),('Accepted - Invoice c','Disputed - Waiver to be processed / Invoice Cancellation'),('Collectable - Custom','Dispute Rejected'),('Collectable','Dispute Rejected'),('Accepted','Disputed - Waiver to be processed / Invoice Cancellation'),('Accepted - No Change','Disputed - Waiver to be processed / Invoice Cancellation'),('Accepted - Manual Cr','Disputed - Waiver to be processed / Invoice Cancellation')]
+
+    for x,y in dis_sumarry:
+        OS = OS.withColumn('dis_sumarry',F.when(F.col('dispute_status') == x, y).otherwise(F.col('dis_sumarry')))
+
+    #BL level disput amount 
+    dis_amount = OS.filter(F.col('dis_sumarry').isNotNull()).groupBy('bus_area','comp_code',F.col('debitor').alias('customer_code'),'alloc_nmbr','dis_sumarry').agg(F.round(F.sum(F.col('deb_cre_lc')), 2).alias('dis_amount'))
+    dis_amount = dis_amount.withColumn('dis_amount',F.concat_ws(':','dis_sumarry','dis_amount').alias('dis_amount'))
+    w = Window.partitionBy('bus_area', 'comp_code','customer_code','alloc_nmbr')
+    dis_amount = dis_amount.withColumn('dis_amount', F.array_sort(F.collect_set('dis_amount').over(w)))
+    dis_amount = dis_amount.select('bus_area', 'comp_code','customer_code','alloc_nmbr','dis_amount').distinct()
+
+
+    # BL level OD
+    BL = OS.groupBy('bus_area','comp_code',F.col('debitor').alias('customer_code'),'alloc_nmbr').agg(F.min('doc_date').alias('invoice_date'),F.min('netduedate').alias('due_date'),F.max('days_in_arrears').alias('arrear'),F.lit(None).alias('arrear_bucket'), F.round(F.sum('deb_cre_lc'),2).alias('usd_amount'), F.collect_set('ref_key2').alias('ref_key2'), F.collect_set('ac_doc_typ').alias('doc_type'))
+    BL = BL.filter(F.col('usd_amount') > 0)
+    # BL level OD join dispute amount 
+    BL = BL.join(dis_amount,['bus_area', 'comp_code','customer_code','alloc_nmbr'],'left').distinct()
+
+    BL = BL.withColumnRenamed('alloc_nmbr','BL_No')
+
+    # join ETA, ETD ,POD id,POR id, price owner name
+    tp = tp_doc_after_2017.select(F.col('tp_doc_number').alias('BL_No'),F.col('origin_departure_date').alias('ETD'),F.col('destination_arrival_date').alias('ETA'),'origin_loc','destination_loc','price_owner_name',F.col('shipment_version_instance_id').alias('shipment_id'))
+    BL = BL.join(tp,'BL_No','left')
+    
+    # join POD,POR - city,country
+    origin_loc = location.select(F.col('location_id').alias('origin_loc'),F.col('city').alias('POR_city'),F.col('country').alias('POR_country')).distinct()
+    destination_loc = location.select(F.col('location_id').alias('destination_loc'),F.col('city').alias('POD_city'),F.col('country').alias('POD_country')).distinct()
+    BL = BL.join(origin_loc,'origin_loc','left').join(destination_loc,'destination_loc','left')
+    
+    # join PRS_customer_PIC
+    PRS_list = od_Customer_list_PRS.select(F.col('SAP_code').alias('customer_code'),'Customer_Name','PIC')
+    PIC = od_PIC_PRS.select(F.col('Collector_UID').alias('PIC'),'Collection_TL','Collection_MNG')
+    PRS_list = PRS_list.join(PIC,'PIC','left').distinct()
+    BL = BL.join(PRS_list,'customer_code','left').distinct()
+    
+    # join commodity_name
+    commodity_name = cargo.groupBy('shipment_id').agg(F.collect_set('commodity_name').alias('commodity_name')).distinct()
+    BL = BL.join(commodity_name,'shipment_id','left').distinct()
+
+
+    # arrear_Bucket
+    arrear_bucket = [[365,float("inf")],[181,365],[121,180],[91,120],[61,90],[31,60],[16,30],[8,15],[1,7]]
+    
+    for d1,d2 in arrear_bucket:
+        if d1 == 365:
+            BL = BL.withColumn('arrear_bucket', F.when(F.col('arrear').between(d1,d2),'Over %s Days' % (d1)).otherwise(F.col('arrear_bucket')))
+        else:
+            BL = BL.withColumn('arrear_bucket', F.when(F.col('arrear').between(d1,d2),'%s-%s Days' % (d1,d2)).otherwise(F.col('arrear_bucket')))
+    # join shipment_status which not active
+    # shipment_status = shipment.filter((F.col('shipment_status') != 'Active') & (F.col('shipment_status') != 'Completed')).select(F.col('booking_number').alias('BL_No'),'shipment_status')
+    shipment_status = shipment.select('booking_number','shipment_status')
+    BL = BL.join(shipment_status,((F.col('BL_No') == F.col('booking_number')) & F.col('ETD').isNull()),'left').distinct()
+
+    # join afr task status
+    afr_doc = multiple_AFR_check.filter(F.col('afr_task') =='Approve Freight Release (Documentation)').select(F.col('transport_doc_number').alias('BL_No'),F.col('afr_status').alias('AFR_DOC'))
+    afr_imp = multiple_AFR_check.filter(F.col('afr_task') =='Approve Freight Release (Import)').select(F.col('transport_doc_number').alias('BL_No'),F.col('afr_status').alias('AFR_IMP'))
+    BL = BL.join(afr_doc,'BL_No','left').join(afr_imp,'BL_No','left').distinct()
+
+    BL = BL.drop('origin_loc').drop('destination_loc').drop('shipment_id').drop('booking_number')
+    BL = BL.orderBy(F.col('usd_amount').desc())
+    
+    
+    return BL
+
+    
