@@ -80,3 +80,10 @@ def OD_follow_up(Foo15arl_amend, customer, od_PIC_PRS, od_Customer_list_PRS, loc
     return BL
 
     
+    # FOR JOIN
+    SCV
+     fact_svc = fact_to_scv_code_mapping.select('Location_Code', 'Country_Code')
+    # credity party -> invoice payer.
+    join_fact_svc = F.substring(raw.Customer_Code, 1, 2) == fact_svc.Location_Code
+    raw = raw.join(fact_svc, join_fact_svc, 'left').drop('Location_Code').distinct()
+    raw = raw.withColumn('SCV_Code', F.when(F.col('SCV_Code').isNull(), F.concat('Country_Code', F.substring(F.col('Customer_Code'), 3, 12))).otherwise(F.col('SCV_Code')))
